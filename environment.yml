@@ -1,0 +1,37 @@
+
+channels:
+  - pytorch
+  - defaults
+  - conda-forge
+  - nvidia
+dependencies:
+  - babel=2.10.3
+#   - cudatoolkit=11.6
+#   - cudnn=8.4.1
+  - cupy=11.0.0
+  - curl=7.83.1
+  - h5py=3.7.0
+  - imageio=2.22.0
+  - intel-openmp=2022.0.1
+  - ipykernel=6.15.2
+  - jupyterlab_server=2.15.1
+  - jupyterlab_widgets=3.0.2
+  - matplotlib=3.5.3
+  - mkl=2022.0.1
+  - numpy=1.22.4
+  - numba=0.55.2
+  - pip=22.2.2
+  - python=3.10
+#   - pyqt
+  - pytorch=1.12.1
+  - scipy=1.9.1
+  - scikit-learn
+  - scikit-image
+#   - torchvision=0.13.1
+#   - tzdata
+  - yaml=0.2.5
+  - pip:
+    - pytorch-lightning==1.7.4
+    - sigpy==0.1.23
+#     - torchmetrics==0.9.3
+
