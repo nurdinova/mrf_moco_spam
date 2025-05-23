@@ -12,12 +12,23 @@ def rot_matrix(axis, angle):
         mat = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
     return np.array(mat)
 
-def kspace_rigid_moco(ksp_mov_ctgr, crds_mov_ctgr, mo_estim_ngp, N, motion_frequency=None, device=None):
+def grid_coords_scaled(nx, ny, nz):
+    """
+    Generate 3D Cartesian grid coordinates with shape [3, nx, ny, nz],
+    scaled to range [-0.5/N, 0.5 - 0.5/N] in each dimension.
+    """
+    grid = np.meshgrid(
+        (np.arange(nx) + 0.5) / nx - 0.5 / nx,
+        (np.arange(ny) + 0.5) / ny - 0.5 / ny,
+        (np.arange(nz) + 0.5) / nz - 0.5 / nz,
+        indexing='ij'
+    )
+    return np.stack(grid, axis=0)
+
+def kspace_rigid_moco(ksp_mov_ctgr, crds_mov_ctgr, mo_estim_ngp, image_dims=None, device=None):
     """
     Rigid motion correction applied as phase ramp + coordinate rotation in k-space. 
-    If device is None, Operations are performed on the same device where the provided k-space data resides.
     
-    If <motion_frequency> is not specified 
     Args:
         ksp_mov_ctgr : ndarray, dims - [coil, time, group, repetition]
             k-space data for the case with integroup motion
@@ -26,11 +37,10 @@ def kspace_rigid_moco(ksp_mov_ctgr, crds_mov_ctgr, mo_estim_ngp, N, motion_frequ
             values are in range [-0.5/N, 0.5/N], where N is image dimension and cubic volume are assumed.
         mo_estim_ngp : ndarray, dims - [poses per group, groups,  parameters]
             estimated 6 rigid motion parameters in pixels/rads
-        motion_frequency : int
-            frequency [in repetitions] of the motion estimates provided 
-            Default: None, motion params are applied every group.
-        N : int
-            image dimension in pixels
+        image_dims = (nx, ny, nz): tuple or list
+            image dimensions in pixels
+            if None, take the dimensions of k-space, assuming res = 1
+        device : optional, computation device (defaults to k-space device)
         
     Returns:
         ksp_moco_ctgr : ndarray, dims - [coil, time, group, repetition]
@@ -47,7 +57,10 @@ def kspace_rigid_moco(ksp_mov_ctgr, crds_mov_ctgr, mo_estim_ngp, N, motion_frequ
     
     nc, nt, ng, nr = crds_mov_ctgr.shape
     Nt_navi = mo_estim_ngp.shape[0]
-    nr_per_motion = nr // Nt_navi #motion_frequency if motion_frequency else nr # Number of TR per motion states 
+    assert nr % Nt_navi == 0, "Repetitions must be divisible by number of motion states"
+    nr_per_motion = nr // Nt_navi 
+    
+    nx, ny, nz = tuple(image_dims) if image_dims else ksp_mov_ctgr.shape[1:]
          
     with device:
         ksp_moco_ctgr_dev = mvd(ksp_mov_ctgr)
@@ -76,9 +89,9 @@ def kspace_rigid_moco(ksp_mov_ctgr, crds_mov_ctgr, mo_estim_ngp, N, motion_frequ
                 crds_ctr_rot = crds_c_tr_rot.reshape((3, nt, r_end-r_begin))
                 crds_rot_ctgr[:, :, gr_ii, r_begin:r_end] = crds_ctr_rot
 
-                ph_ramp_x_ctr = xp.exp( -2j * xp.pi * dx * crds_ctr_rot[[0]] / N)
-                ph_ramp_y_ctr = xp.exp( -2j * xp.pi * dy * crds_ctr_rot[[1]] / N)
-                ph_ramp_z_ctr = xp.exp( -2j * xp.pi * dz * crds_ctr_rot[[2]] / N)
+                ph_ramp_x_ctr = xp.exp( -2j * xp.pi * dx * crds_ctr_rot[[0]] / nx)
+                ph_ramp_y_ctr = xp.exp( -2j * xp.pi * dy * crds_ctr_rot[[1]] / ny)
+                ph_ramp_z_ctr = xp.exp( -2j * xp.pi * dz * crds_ctr_rot[[2]] / nz)
 
                 ksp_moco_ctgr_dev[:, :, gr_ii, r_begin:r_end] *= ph_ramp_x_ctr * ph_ramp_y_ctr * ph_ramp_z_ctr
     return ksp_moco_ctgr_dev, crds_rot_ctgr
