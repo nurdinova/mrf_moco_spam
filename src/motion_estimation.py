@@ -18,13 +18,12 @@ from plot_utils import plot_3dimg, find_closest_in_dict, plot_motion_traj
 from motion_smooth_fit import fit_smooth
 from dict_match_gpu import match_toDict_gpu
 from external import call_afni, call_flirt
-from scipy.linalg import eig
 
 
 def analyze_match_interscan(ksp_nav_gct, dict_mo_mct, dict_mo_idx_full, groups, img_vols_gxyz, motion_GT=None, \
                             loss="l1", subspace_u=None, return_matched=False, device=None, plot=True, verbose=0, \
                             Phi=None, T_ind=0, chunksize=None, ksp_dict_zero=None, ksp_nav_zero=False, \
-                            mo_prev_gp=None, lamda_kalman=0., n_minima=1):
+                            mo_prev_gp=None, lamda_reg=0., reg_scale_p=None, n_minima=1):
     """
     Estimate motion with dictionary matching amd compare the results to registration.
     Analysis will be done per group and for all coil channles/components.
@@ -82,7 +81,7 @@ def analyze_match_interscan(ksp_nav_gct, dict_mo_mct, dict_mo_idx_full, groups, 
                                                 motion_GT[group], loss=loss, chunksize=chunksize, \
                                                 plot=plot, verbose=verbose, subspace_u=subspace_u, Phi=Phi, T_ind=T_ind, \
                                                 ksp_dict_zero=ksp_dict_zero, ksp_nav_zero=ksp_nav_zero, mo_prev=mo_prev, \
-                                                                    lamda_kalman=lamda_kalman, n_minima_chunk=n_minima)
+                                                                    lamda_reg=lamda_reg, reg_scale_p=reg_scale_p, n_minima_chunk=n_minima)
         if return_matched:
             ksp_matched[group_ii] = np.copy(matched)
         L1_res[group_ii] = (np.sort(loss_l1)[0])
@@ -94,7 +93,7 @@ def match_navi(ksp_navi_ngc_tr, dict_ksp_mctq, dict_mo_pars_mp, \
                nn_model_name=None, match_difference=False, save_match=False, \
                dir_figure='./', dir_matching='', save_tag='', smoothfit_motion_noGT=False, \
                smoothfit_motion_with_GT=False, smoothfit_motion_GT=False, verbose=0, \
-               smooth_match=False, lamda_kalman=0., mo_prev_gp=None, n_minima=1):
+               smooth_match=False, lamda_reg=0., reg_scale_p=None, mo_prev_gp=None, n_minima=1):
     """
     ksp_navi_ngc_tr : on device
     dict_ksp_mctq : memmap on cpu
@@ -146,7 +145,7 @@ def match_navi(ksp_navi_ngc_tr, dict_ksp_mctq, dict_mo_pars_mp, \
                                                               np.arange(N_GR), img_navi_pxyz, plot=verbose, verbose=verbose, loss="dot_cmpl",\
                                                               motion_GT=mo_GT, chunksize=dict_ksp_mctq.shape[0]//2,\
                                                               return_matched=False, mo_prev_gp=mo_prev_gp, \
-                                                                   lamda_kalman=lamda_kalman, n_minima=n_minima)
+                                                                   lamda_reg=lamda_reg, reg_scale_p=reg_scale_p, n_minima=n_minima)
             elif match_mode == 'MLP':
                 results_matching_dot_svd = analyze_nn_regressor_interscan(ksp_gpu_gct, nn_model_name, motion_GT=mo_GT, \
                                                img_vols_gxyz=img_navi_pxyz, torch_device_idx=device.id)
@@ -391,58 +390,107 @@ def dot_prod(x, y):
     return np.vdot(x_re, y_re) / (np.linalg.norm(x_re)*np.linalg.norm(y_re))
 
 
-def gEVD_dictionary(dict_ksp_nmct, ksp_stat_ngct=None, xp=np, method='gEVD', unit_variance=False, demean_data=True, scale_variance=True):
+def linear_discriminant_basis(dictionary_mct, static_signal_ct, noise_covariance_cc, xp=np):
     """
-    Expected normalized arrays
+    Class-mean linear discriminant time basis: solves S_between u = lambda S_within u.
+
+    Every motion state is a class. The no-motion class holds both the simulated and the
+    measured static signal, so the within-class scatter combines the simulation-to-measurement
+    mismatch with the coil noise. All inputs must be on the same scale.
+
+    dictionary_mct      : (N_motion, N_channels, N_t) simulated dictionary, index 0 = no motion
+    static_signal_ct    : (N_channels, N_t) measured no-motion navigator
+    noise_covariance_cc : (N_channels, N_channels) coil noise covariance per k-space sample
+
+    Returns
+    basis_tt    : (N_t, N_t) generalized eigenvectors as columns, eigenvalue-descending.
+                  Project with V^H s, i.e. s @ conj(basis_tt).
+    eigenvalues : (N_t,) generalized eigenvalues, descending
     """
-    device = sp.get_device(dict_ksp_nmct)
+    if xp is np:
+        from scipy.linalg import solve_triangular
+    else:
+        from cupyx.scipy.linalg import solve_triangular
+
+    dictionary_mct = xp.asarray(dictionary_mct, dtype=np.complex64)
+    n_motion, n_channels, n_time = dictionary_mct.shape
+    static_signal_ct = xp.asarray(static_signal_ct, dtype=np.complex64).reshape((n_channels, n_time))
+
+    # no-motion class holds both the simulated and the measured signal
+    class_mean_ct = (dictionary_mct[1:].sum(0) + 0.5 * (static_signal_ct + dictionary_mct[0])) / n_motion
+    centered_mc_t = (dictionary_mct - class_mean_ct).reshape((n_motion * n_channels, n_time))
+    scatter_between_tt = centered_mc_t.T @ centered_mc_t.conj()
+    del centered_mc_t
+
+    mismatch_ct = static_signal_ct - dictionary_mct[0]
+    scatter_within_tt = 0.5 * (mismatch_ct.T @ mismatch_ct.conj())
+    noise_power = float(xp.real(xp.trace(xp.asarray(noise_covariance_cc))))
+    scatter_within_tt += n_motion * noise_power * xp.eye(n_time, dtype=scatter_within_tt.dtype)
+
+    # whiten with Cholesky: A = L^-1 S_between L^-H, basis = L^-H V
+    cholesky_tt = xp.linalg.cholesky(scatter_within_tt)
+    del scatter_within_tt
+    whitened_tt = solve_triangular(cholesky_tt, scatter_between_tt, lower=True)
+    del scatter_between_tt
+    whitened_tt = solve_triangular(cholesky_tt, xp.conj(whitened_tt).T, lower=True)
+    whitened_tt = 0.5 * (whitened_tt + xp.conj(whitened_tt).T)
+
+    eigenvalues, eigenvectors_tt = xp.linalg.eigh(whitened_tt)   # ascending
+    del whitened_tt
+    basis_tt = solve_triangular(xp.conj(cholesky_tt).T, eigenvectors_tt, lower=False)
+    return basis_tt[:, ::-1], eigenvalues[::-1]
+
+
+def time_compression_basis(dictionary_mct, static_signal_ct=None, noise_covariance_cc=None, method='whiten_SVD',
+                           xp=np, demean=True, unit_variance=False, scale_variance=True):
+    """
+    Time-compression basis of the navigator signals from a small motion dictionary.
+
+    method
+        'whiten_SVD' : class-mean linear discriminant basis (see linear_discriminant_basis), whitened
+                       against the simulation-to-measurement mismatch and the coil noise.
+                       Needs static_signal_ct and noise_covariance_cc; demean, unit_variance and
+                       scale_variance do not apply.
+        'SVD'        : singular vectors of the dictionary covariance D^H D.
+
+    dictionary_mct      : (N_motion, N_channels, ..., N_t) simulated dictionary, index 0 = no motion
+    static_signal_ct    : (N_channels, ..., N_t) measured no-motion navigator, same scale as the dictionary
+    noise_covariance_cc : (N_channels, N_channels) coil noise covariance per k-space sample, same scale
+    demean              : SVD only, remove the mean over the channel axis (axis 1)
+    unit_variance       : SVD only, also divide by the standard deviation over the channel axis
+    scale_variance      : SVD only, divide the covariance by the number of signals
+
+    Returns
+    basis_tt : (N_t, N_t) basis as columns, ordered by decreasing value; project with signal @ basis_tt
+    values   : (N_t,) singular values (SVD) or generalized eigenvalues (whiten_SVD)
+    """
+    device = sp.get_device(dictionary_mct)
+    n_time = dictionary_mct.shape[-1]
+
     with device:
-        if unit_variance and demean_data:
-            dict_ksp_nmct_demean = (dict_ksp_nmct - xp.mean(dict_ksp_nmct, axis=1, keepdims=True)) / (1e-2 + xp.std(dict_ksp_nmct, axis=1, keepdims=True))
-        elif demean_data:
-            dict_ksp_nmct_demean = dict_ksp_nmct - xp.mean(dict_ksp_nmct, axis=1, keepdims=True)   
-        else:
-            dict_ksp_nmct_demean = dict_ksp_nmct
-            
-        ng_dict = dict_ksp_nmct_demean.shape[0] * dict_ksp_nmct_demean.shape[1]
-        D_nm_ct = dict_ksp_nmct_demean.reshape((ng_dict, -1))
-        del dict_ksp_nmct_demean, dict_ksp_nmct
-        
-        Q = xp.matmul(xp.conj(D_nm_ct).T, D_nm_ct) 
-        if scale_variance: 
-            Q /= (ng_dict - 1)
-        print(f'Q shape {Q.shape}')
-        
-        if method in ['gEVD', 'pinv_SVD']:
-            if unit_variance and demean_data:
-                ksp_stat_ngct_demean = (ksp_stat_ngct - xp.mean(ksp_stat_ngct, axis=1, keepdims=True)) / ( 1e-2 + xp.std(ksp_stat_ngct, axis=1, keepdims=True))
-            elif demean_data:
-                ksp_stat_ngct_demean = ksp_stat_ngct - xp.mean(ksp_stat_ngct, axis=1, keepdims=True)   
-            else:
-                ksp_stat_ngct_demean = ksp_stat_ngct
-                
-            ng_ksp_stat = ksp_stat_ngct_demean.shape[0] * ksp_stat_ngct_demean.shape[1]
-            s_ng_ct = ksp_stat_ngct_demean.reshape((ng_ksp_stat, -1))
-            del ksp_stat_ngct_demean, ksp_stat_ngct
-            
-            P = xp.matmul(xp.conj(s_ng_ct).T, s_ng_ct)
-            if scale_variance:
-                P /= (ng_ksp_stat - 1)
-            del s_ng_ct
-            print(f'P shape {P.shape}')
-            print(f'max values of P and Q', xp.max(xp.abs(P)), xp.max(xp.abs(Q)))
-            
-            if  method == 'gEVD':
-                result = eig(Q.get(), P.get(), overwrite_a=True, overwrite_b=True) # right e.v.
-                if_symmetric = False
-            elif method == 'pinv_SVD':
-                P_inv_Q = xp.matmul(xp.linalg.pinv(P), Q)
-                del P, Q
-                if_symmetric = xp.allclose(P_inv_Q, xp.conj(P_inv_Q).T, rtol=1e-6, atol=1e-8)
-                result = xp.linalg.svd(P_inv_Q, full_matrices=False)
-        
+        if method == 'whiten_SVD':
+            if static_signal_ct is None or noise_covariance_cc is None:
+                raise ValueError('whiten_SVD needs static_signal_ct and noise_covariance_cc')
+            n_motion = dictionary_mct.shape[0]
+            basis_tt, values = linear_discriminant_basis(dictionary_mct.reshape((n_motion, -1, n_time)),
+                                                         static_signal_ct.reshape((-1, n_time)),
+                                                         noise_covariance_cc, xp=xp)
+            # V^H s = s @ conj(V)
+            return xp.conj(basis_tt), values
+
         if method == 'SVD':
-            result = xp.linalg.svd(Q, full_matrices=False)
-            if_symmetric = False 
-                
-    return result, if_symmetric
+            if demean:
+                dictionary_mct = dictionary_mct - xp.mean(dictionary_mct, axis=1, keepdims=True)
+                if unit_variance:
+                    dictionary_mct = dictionary_mct / (1e-2 + xp.std(dictionary_mct, axis=1, keepdims=True))
+
+            signals_st = dictionary_mct.reshape((-1, n_time))
+            covariance_tt = xp.matmul(xp.conj(signals_st).T, signals_st)
+            if scale_variance:
+                covariance_tt /= signals_st.shape[0]
+            del signals_st
+
+            basis_tt, values, _ = xp.linalg.svd(covariance_tt, full_matrices=False)
+            return basis_tt, values
+
+    raise ValueError(f"Unknown method '{method}', expected 'whiten_SVD' or 'SVD'")

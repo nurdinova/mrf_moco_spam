@@ -41,7 +41,7 @@ def calc_dot_cmpl(dict_mct_chunk, ksp_nav_ct, xp):
 
 def match_toDict_gpu(ksp_nav_ct, dict_mct, dict_mo_idx_mp, motion_true=None, Nt_lo=0, Nt_up=0, loss="l1", plot=False, \
                      weighting=0, sens_maps=None, crds_nav=None, subspace_u=None, verbose=0, device=None, chunksize=None, \
-                     Phi=None, T_ind=None, ksp_dict_zero=None, ksp_nav_zero=None, n_minima_chunk=1, mo_prev=None, lamda_kalman=0.):
+                     Phi=None, T_ind=None, ksp_dict_zero=None, ksp_nav_zero=None, n_minima_chunk=1, mo_prev=None, lamda_reg=0., reg_scale_p=None):
     """
     Matching provided k-space navigator signal to the motion dictionary.
     
@@ -68,6 +68,11 @@ def match_toDict_gpu(ksp_nav_ct, dict_mct, dict_mo_idx_mp, motion_true=None, Nt_
             if the provided dictionary is in lower-dimensional space
         verbose: 
             allow prints of the results
+        mo_prev : array of size (N_motion_dof=6)
+            motion of the previous navigator; if provided, the n_minima_chunk best entries per chunk
+            are re-ranked with the regularization lamda_reg * ||(mo_prev - motion) / reg_scale_p||
+        reg_scale_p : array of size (N_motion_dof=6)
+            per-parameter scale of the regularization (e.g. dictionary grid steps); None = unscaled
         
     Return:
         ksp_matched : array of size (N_channels, N_timepoints)
@@ -102,7 +107,7 @@ def match_toDict_gpu(ksp_nav_ct, dict_mct, dict_mo_idx_mp, motion_true=None, Nt_
 
         N_chunks = (n_mo_pars + chunksize - 1) // chunksize        
         ksp_loss_m_gpu = xp.zeros((n_mo_pars), dtype=xp.float64)
-        min_idx_chunks = xp.zeros((N_chunks, n_minima_chunk), dtype=np.int16) # motion index with the lowest loss
+        min_idx_chunks = xp.zeros((N_chunks, n_minima_chunk), dtype=np.int64) # motion index with the lowest loss
 
         for chunk_ii in range(N_chunks):
 
@@ -147,7 +152,9 @@ def match_toDict_gpu(ksp_nav_ct, dict_mct, dict_mo_idx_mp, motion_true=None, Nt_
             if mo_prev is None:
                 loss_total = xp.zeros((len(min_idx_chunks), ))
             else:
-                loss_total = lamda_kalman * xp.linalg.norm(mvd(mo_prev - dict_mo_idx_mp[min_idx_chunks]), axis=-1)
+                # distance in units of reg_scale_p (e.g. grid steps), so that shifts and rotations are comparable
+                mo_diff_mp = (mo_prev - dict_mo_idx_mp[min_idx_chunks]) / (1. if reg_scale_p is None else np.asarray(reg_scale_p))
+                loss_total = lamda_reg * xp.linalg.norm(mvd(mo_diff_mp), axis=-1)
             if loss in ["l1", "l2", "corr_diff"]:
                 loss_total += ksp_loss_m_gpu[min_idx_chunks]
             elif loss in ["dot", "dot_cmpl"]:
